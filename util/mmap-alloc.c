@@ -414,6 +414,29 @@ static void *mmap_activate(void *ptr, size_t size, int fd,
             }
             pthread_attr_destroy(&attr);
         }
+
+        /* [mem] Host memory picture once all three backends are placed:
+         * VmPeak/VmSize reflect the identity mappings and the low shadow. */
+        {
+            long vmpeak = -1, vmsize = -1, vmrss = -1;
+            FILE *f = fopen("/proc/self/status", "r");
+            if (f) {
+                char line[128];
+                while (fgets(line, sizeof(line), f)) {
+                    if (!strncmp(line, "VmPeak:", 7)) {
+                        vmpeak = atol(line + 7);
+                    } else if (!strncmp(line, "VmSize:", 7)) {
+                        vmsize = atol(line + 7);
+                    } else if (!strncmp(line, "VmRSS:", 6)) {
+                        vmrss = atol(line + 6);
+                    }
+                }
+                fclose(f);
+            }
+            log_always("[mem] host VmPeak=%ld kB VmSize=%ld kB VmRSS=%ld kB\n",
+                       vmpeak, vmsize, vmrss);
+        }
+
         global_ram3_address = activated_ptr;
 
         log_always("========BACKEND-SETUP\n\n");

@@ -434,6 +434,27 @@ typedef struct {
 gem_slots_t gem_slots = {0};
 gem_slots_t gem_hugepage_slots = {0};
 
+/* [mem] Bucket usage instrumentation: the bases of the bump pointers and the
+ * high-water marks seen so far, logged when they grow. Sizing input for the
+ * memory-reservation work. */
+static uint64_t gem_regular_base = 0;
+static uint64_t gem_hugepage_base = 0;
+static uint64_t gem_regular_peak = 0;
+static uint64_t gem_hugepage_peak = 0;
+
+static void gem_report_peak(const char *name, uint64_t *peak, uint64_t base,
+                            uint64_t next, uint64_t region_size) {
+  uint64_t used = next > base ? next - base : 0;
+  if (used <= *peak) {
+    return;
+  }
+  *peak = used;
+  log_always("[mem] Gem %s bucket: %llu / %llu MiB (%.1f%%)\n", name,
+             (unsigned long long)(used >> 20),
+             (unsigned long long)(region_size >> 20),
+             region_size ? (100.0 * used) / region_size : 0.0);
+}
+
 xcb_window_t win;
 xcb_connection_t *conn;
 
@@ -530,6 +551,7 @@ void setup_comm_data_regions(volatile comm_page_t *c) {
 
   gem_slots.host_address = ((uint64_t)data_region_actual_address);
   gem_slots.guest_address = ((uint64_t)DATA_REGION);
+  gem_regular_base = gem_slots.host_address;
 
   // Wait for hugedata addr
   while (c->p1 == 0) {
@@ -561,6 +583,7 @@ void setup_comm_data_regions(volatile comm_page_t *c) {
 
   gem_hugepage_slots.host_address = ((uint64_t)hugepage_host_addr);
   gem_hugepage_slots.guest_address = ((uint64_t)HUGEPAGE_DATA_REGION);
+  gem_hugepage_base = gem_hugepage_slots.host_address;
 
   create_and_setup_xcb_window();
   log_always("XCB window created\n");
@@ -705,6 +728,8 @@ extern void *mmap_listener(void *arg) {
         pthread_mutex_lock(&gem_slots_lock);
         gem_hugepage_slots.host_address += size;
         gem_hugepage_slots.guest_address += size;
+        gem_report_peak("hugepage", &gem_hugepage_peak, gem_hugepage_base,
+                        gem_hugepage_slots.host_address, HUGE_DATA_SIZE);
         pthread_mutex_unlock(&gem_slots_lock);
 
       } else {
@@ -737,6 +762,8 @@ extern void *mmap_listener(void *arg) {
         pthread_mutex_lock(&gem_slots_lock);
         gem_slots.host_address += gem_regular_advance(size);
         gem_slots.guest_address += gem_regular_advance(size);
+        gem_report_peak("regular", &gem_regular_peak, gem_regular_base,
+                        gem_slots.host_address, DATA_SIZE);
         pthread_mutex_unlock(&gem_slots_lock);
       }
 
