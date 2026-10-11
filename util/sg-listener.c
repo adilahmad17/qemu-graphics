@@ -427,6 +427,8 @@ static ioctl_stat *get_ioctl_stat(unsigned long request) {
 struct timespec ts;
 void *data_region_actual_address = NULL;
 void *hugepage_host_addr = NULL;
+size_t data_region_size = DATA_SIZE;
+size_t huge_region_size = HUGE_DATA_SIZE;
 typedef struct {
   uint64_t host_address;
   uint64_t guest_address;
@@ -557,32 +559,43 @@ void setup_comm_data_regions(volatile comm_page_t *c) {
   while (c->p1 == 0) {
     usleep(1000);
   }
-  // Set hugepage_host_addr
-  hugepage_host_addr = (void *)((uint64_t)(c->p1 - (uint64_t)0x180000000ULL) +
-                                (uint64_t)global_ram3_address);
-  HUGEPAGE_DATA_REGION = (void *)c->p1;
+  /* The guest sends the arena sizes alongside the hugepage address (c->p2 =
+   * data size, c->p3 = hugepage size); adopt them when present. All guest RAM
+   * is identity-mapped, so the host address of every guest physical address is
+   * the address itself. */
+  if (c->p2) {
+    data_region_size = c->p2;
+  }
+  if (c->p3) {
+    huge_region_size = c->p3;
+  }
+  hugepage_host_addr = (void *)(uintptr_t)c->p1;
+  uint64_t huge_guest_addr = c->p1;
 
-  if (hugepage_host_addr != HUGEPAGE_DATA_REGION) {
-    log_always(
-        "FATAL: hugepage region not identity-mapped (guest=%p host=%p)\n",
-        (void *)(uintptr_t)HUGEPAGE_DATA_REGION,
-        (void *)(uintptr_t)hugepage_host_addr);
+  if (huge_guest_addr <
+      (uint64_t)(uintptr_t)DATA_REGION + data_region_size) {
+    log_always("FATAL: hugepage arena %p does not start at or after the data "
+               "arena end %p\n",
+               (void *)(uintptr_t)hugepage_host_addr,
+               (void *)((uint64_t)(uintptr_t)DATA_REGION + data_region_size));
     assert(false);
   }
 
   c->p1 = 0; // clear addr arg
+  c->p2 = 0;
+  c->p3 = 0;
   log_always("HUGEPAGE_DATA REGION: (guest=%p, host=%p)\n",
-             (void *)(uint64_t)HUGEPAGE_DATA_REGION, hugepage_host_addr);
+             (void *)(uint64_t)huge_guest_addr, hugepage_host_addr);
 
   while (*((uint64_t *)hugepage_host_addr) != 0x1234567812344678ULL) {
     usleep(1000);
   }
   log_always("HUGEPAGE_DATA MAGIC: %p\n",
-             (void *)*((uint64_t *)HUGEPAGE_DATA_REGION));
+             (void *)*((uint64_t *)hugepage_host_addr));
   *((uint64_t *)hugepage_host_addr) = 0x2;
 
   gem_hugepage_slots.host_address = ((uint64_t)hugepage_host_addr);
-  gem_hugepage_slots.guest_address = ((uint64_t)HUGEPAGE_DATA_REGION);
+  gem_hugepage_slots.guest_address = ((uint64_t)huge_guest_addr);
   gem_hugepage_base = gem_hugepage_slots.host_address;
 
   create_and_setup_xcb_window();
@@ -676,11 +689,11 @@ extern void *mmap_listener(void *arg) {
       bool hugepage_has_capacity =
           gem_bucket_has_capacity(&gem_hugepage_slots, size,
                                   (uint64_t)(uintptr_t)hugepage_host_addr,
-                                  HUGE_DATA_SIZE);
+                                  huge_region_size);
       bool regular_has_capacity =
           gem_bucket_has_capacity(&gem_slots, size,
                                   (uint64_t)(uintptr_t)data_region_actual_address,
-                                  DATA_SIZE);
+                                  data_region_size);
 
       if (use_hugepage_bucket && !hugepage_has_capacity && regular_has_capacity) {
         log_gem("hugepage bucket full for size 0x%lx, falling back to regular bucket\n",
@@ -729,7 +742,7 @@ extern void *mmap_listener(void *arg) {
         gem_hugepage_slots.host_address += size;
         gem_hugepage_slots.guest_address += size;
         gem_report_peak("hugepage", &gem_hugepage_peak, gem_hugepage_base,
-                        gem_hugepage_slots.host_address, HUGE_DATA_SIZE);
+                        gem_hugepage_slots.host_address, huge_region_size);
         pthread_mutex_unlock(&gem_slots_lock);
 
       } else {
@@ -763,7 +776,7 @@ extern void *mmap_listener(void *arg) {
         gem_slots.host_address += gem_regular_advance(size);
         gem_slots.guest_address += gem_regular_advance(size);
         gem_report_peak("regular", &gem_regular_peak, gem_regular_base,
-                        gem_slots.host_address, DATA_SIZE);
+                        gem_slots.host_address, data_region_size);
         pthread_mutex_unlock(&gem_slots_lock);
       }
 

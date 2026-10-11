@@ -79,6 +79,12 @@ extern void* global_ram_address;
 extern void* global_ram1_address;
 extern void* global_ram2_address;
 extern void* global_ram3_address;
+
+/* Arena sizes in bytes, sent by the guest during comm-page setup (c->p2 for
+ * the data arena, c->p3 for the hugepage arena). The compiled constants below
+ * remain the fallback for guests that do not send them. */
+extern size_t data_region_size;
+extern size_t huge_region_size;
 typedef struct {
     volatile uint64_t magic;
     volatile uint64_t req_bit;
@@ -153,15 +159,16 @@ static const  size_t PAGE_SIZE    = 4*1024;
 #define COMM_ADDR  0xf00000ULL
 #define COMM_MAGIC 0x1234567812345678ULL
 
-// static void* DATA_REGION = (void*)0x100008000ULL;
+/* Data arena: guest physical [DATA_REGION, DATA_REGION + size). The size is
+ * configured by the manifest as sys.experimental__graphics_data_size, sent by
+ * the guest in the comm page setup (c->p2), and adopted at runtime. DATA_REGION
+ * itself stays fixed: the host waits for the data magic there. */
 static void* DATA_REGION = (void*)0x100000000ULL;
-static void* HUGEPAGE_DATA_REGION = (void*)0x200000000ULL;
-static void* DATA_HOST_OFFSET = (void*)0x80000000ULL;
 
-// This is different than where it appears in the guest.
-// Qemu maps the ram region from 0x80000000 into the allocation to 0x100000000 in the guest AS
-// static void* DATA_HOST_OFFSET = (void*)0x80008000ULL;
-
+/* Hugepage arena: guest physical address is computed by the guest as
+ * DATA_REGION + data size and sent in the comm page setup (c->p1); the size
+ * arrives in c->p3. All guest RAM is identity-mapped, so the host address
+ * equals the guest physical address. */
 static void* UNMAP_DATA_MSG = (void*)0x1234567f1234567fULL;
 
 
