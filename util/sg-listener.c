@@ -1,3 +1,5 @@
+/* Copyright (C) 2026 The ASTERISC Research Lab */
+
 #include "qemu/osdep.h"
 #include "include/qemu/sg.h"
 #include "hw/core/cpu.h"

@@ -1,3 +1,5 @@
+/* Copyright (C) 2026 The ASTERISC Research Lab */
+
 #pragma once
 #ifndef QEMU_SG_H
 #define QEMU_SG_H
