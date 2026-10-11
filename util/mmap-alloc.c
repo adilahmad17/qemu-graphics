@@ -39,6 +39,14 @@
 static const void *VIRTUAL_ADDRESS_LOW = (void*)0x200000ULL;        // 2MB
 static const void *VIRTUAL_ADDRESS_MED = (void*)0x100000000ULL;        // 4GB
 static const void *VIRTUAL_ADDRESS_HIGH = (void*)0x180000000ULL;    // 6GB
+static const void *VIRTUAL_ADDRESS_HIGH2 = (void*)0x1C0000000ULL;   // 7GB
+
+/* Boot-time instrumentation: t0 is taken at the first RAM backend placement so
+ * the [boot] stamps can be compared with the guest-side ones. */
+static int64_t boot_t0_us = -1;
+static inline int64_t boot_elapsed_us(void) {
+    return g_get_monotonic_time() - boot_t0_us;
+}
 
 static const size_t LOW_OFFSET_INTO_MEMORY = 0x40000000ULL;           // 1MB
 // static const void *VIRTUAL_ADDRESS_LOW = (void*)0x40000000ULL;        // 1MB
@@ -339,7 +347,12 @@ static void *mmap_activate(void *ptr, size_t size, int fd,
     }
 
 #if 1
-    /* TODO: This hardcodes the three DIMM logic. */
+    /* TODO: This hardcodes the backend logic (low backend + identity-native
+     * upper backends; a hugetlb deployment adds a fourth backend for the
+     * hugepage GEM bucket). */
+    if (boot_t0_us < 0) {
+        boot_t0_us = g_get_monotonic_time();
+    }
     if (dimm_counter == 0) {
         log_always("\n");
         log_always("========BACKEND-SETUP\n");
@@ -360,8 +373,9 @@ static void *mmap_activate(void *ptr, size_t size, int fd,
             }
         }
         global_ram1_address = activated_ptr;
+        log_always("[boot] low backend placed +%ld ms\n", (long)(boot_elapsed_us() / 1000));
         dimm_counter++;
-        
+
     } else if (dimm_counter == 1) {
         log_always("========DIMM2========\n");
         if(qemu_map_flags & QEMU_MAP_SHARED){
@@ -384,6 +398,7 @@ static void *mmap_activate(void *ptr, size_t size, int fd,
         // This should be the global ram address (used by sg-listener)
         global_ram_address = activated_ptr;
         global_ram2_address = activated_ptr;
+        log_always("[boot] backend 1 placed +%ld ms\n", (long)(boot_elapsed_us() / 1000));
         dimm_counter++;
     } else if (dimm_counter == 2) {
         log_always("========DIMM3========\n");
@@ -438,8 +453,30 @@ static void *mmap_activate(void *ptr, size_t size, int fd,
         }
 
         global_ram3_address = activated_ptr;
-
+        log_always("[boot] backend 2 placed +%ld ms\n", (long)(boot_elapsed_us() / 1000));
         log_always("========BACKEND-SETUP\n\n");
+        dimm_counter++;
+    } else if (dimm_counter == 3) {
+        /* Fourth backend: the normal-pages app RAM that follows the hugetlb
+         * GEM bucket in a hugepages deployment. Identity-native like the
+         * others; the listener already runs (it was started at backend 2). */
+        log_always("========DIMM4========\n");
+        if (qemu_map_flags & QEMU_MAP_SHARED) {
+            size_t length = size;
+            log_always("[native] %p -- %p\n",
+            activated_ptr,
+            (void *)((uintptr_t)activated_ptr + length));
+
+            off_t offset = map_offset;
+            void *want = (void *) VIRTUAL_ADDRESS_HIGH2;
+            log_always("[identity] %p -- %p)\n", want, (void *)((uintptr_t)want + length));
+
+            if (activated_ptr != want) {
+                log_always("activated != want! -- Host allocation isn't identity mapped.");
+                assert(false);
+            }
+            log_always("[boot] backend 3 placed +%ld ms\n", (long)(boot_elapsed_us() / 1000));
+        }
         dimm_counter++;
     }
 #endif
@@ -471,7 +508,7 @@ void *qemu_ram_mmap(int fd,
     void *ptr, *guardptr;
     const int dimm_idx = dimm_counter;
     const bool try_identity_native = (qemu_map_flags & QEMU_MAP_SHARED) &&
-                                    (dimm_idx == 1 || dimm_idx == 2);
+                                    (dimm_idx >= 1 && dimm_idx <= 3);
     void *identity_want = NULL;
 
     /*
@@ -481,7 +518,9 @@ void *qemu_ram_mmap(int fd,
     total = size + align;
 
     if (try_identity_native) {
-        identity_want = (void *)(dimm_idx == 1 ? VIRTUAL_ADDRESS_MED : VIRTUAL_ADDRESS_HIGH);
+        identity_want = (void *)(dimm_idx == 1 ? VIRTUAL_ADDRESS_MED :
+                                 dimm_idx == 2 ? VIRTUAL_ADDRESS_HIGH :
+                                                 VIRTUAL_ADDRESS_HIGH2);
 
         /* If we can't make ptr==want, we'll fall back to the old 2-mapping setup. */
         if (align && is_power_of_2(align)) {
@@ -529,7 +568,11 @@ void *qemu_ram_mmap(int fd,
      * For identity-native DIMM2 at 0x100000000, drop its guard page so DIMM3
      * can start exactly at 0x180000000.
      */
-    if (try_identity_native && dimm_idx == 1 && ptr == identity_want) {
+    if (try_identity_native && dimm_idx <= 2 && ptr == identity_want) {
+        /* Leave no guard page, so the next identity-native backend can start
+         * exactly at its base: DIMM3 follows DIMM2 at 6G, and in a hugepages
+         * deployment the fourth backend follows the hugetlb bucket at 7G.
+         * The last backend keeps its guard. */
         munmap(ptr + size, guard_pagesize);
         guard_len_record(ptr, 0);
     } else {
