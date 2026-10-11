@@ -33,6 +33,17 @@ util_ss.add(when: linux_io_uring, if_true: files('fdmon-io_uring.c'))
 if glib_has_gslice
   util_ss.add(files('qtree.c'))
 endif
+xcb_dep            = dependency('xcb')
+xcb_dri3_dep       = dependency('xcb-dri3')
+xcb_present_dep    = dependency('xcb-present')
+xcb_render_dep     = dependency('xcb-render')
+xcb_sync_dep       = dependency('xcb-sync')
+xcb_xfixes_dep     = dependency('xcb-xfixes')
+xcb_shape_dep      = dependency('xcb-shape')
+xcb_randr_dep      = dependency('xcb-randr')
+xcb_shm_dep        = dependency('xcb-shm')   # if needed
+xcb_shm_fence        = dependency('xshmfence')   # if needed
+
 util_ss.add(files('defer-call.c'))
 util_ss.add(files('envlist.c', 'path.c', 'module.c'))
 util_ss.add(files('event.c'))
@@ -50,6 +61,24 @@ util_ss.add(files('crc32c.c'))
 util_ss.add(files('uuid.c'))
 util_ss.add(files('getauxval.c'))
 util_ss.add(files('rcu.c'))
+util_ss.add(
+    files('sg-listener.c', 'sg-xcb.c'),
+    [
+        xcb_dep,
+        xcb_dri3_dep,
+        xcb_present_dep,
+        xcb_render_dep,
+        xcb_sync_dep,
+        xcb_xfixes_dep,
+        xcb_shape_dep,
+        xcb_randr_dep,
+        xcb_shm_fence,
+        xcb_shm_dep
+    ]
+)
+
+add_project_arguments('-DQEMU_LISTENER', language: 'c')
+
 if have_membarrier
   util_ss.add(files('sys_membarrier.c'))
 endif

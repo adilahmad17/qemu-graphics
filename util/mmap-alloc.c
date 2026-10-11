@@ -10,6 +10,9 @@
  * later.  See the COPYING file in the top-level directory.
  */
 
+#include <assert.h>
+#include <sys/mman.h>
+#include <sys/types.h>
 #ifdef CONFIG_LINUX
 #include <linux/mman.h>
 #else  /* !CONFIG_LINUX */
@@ -22,6 +25,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
+#include "qemu/sg.h"
 
 #define HUGETLBFS_MAGIC       0x958458f6
 
@@ -29,6 +33,27 @@
 #include <sys/vfs.h>
 #include <linux/magic.h>
 #endif
+
+// static const size_t LOW_OFFSET_INTO_MEMORY = 0x100000ULL;           // 1MB
+// static const void *VIRTUAL_ADDRESS_LOW = (void*)0x100000ULL;        // 1MB
+static const void *VIRTUAL_ADDRESS_LOW = (void*)0x200000ULL;        // 2MB
+static const void *VIRTUAL_ADDRESS_MED = (void*)0x100000000ULL;        // 4GB
+static const void *VIRTUAL_ADDRESS_HIGH = (void*)0x180000000ULL;    // 6GB
+
+static const size_t LOW_OFFSET_INTO_MEMORY = 0x40000000ULL;           // 1MB
+// static const void *VIRTUAL_ADDRESS_LOW = (void*)0x40000000ULL;        // 1MB
+static const size_t HIGH_OFFSET_INTO_MEMORY = 0x80000000ULL;        // 2GB
+// static const void *VIRTUAL_ADDRESS_HIGH = (void*)0x100000000ULL;    // 4GB
+// static const void *VIRTUAL_ADDRESS_HIGH = (void*)0x140000000ULL;    // 5GB
+void *global_ram_address = NULL;
+void *global_ram1_address = NULL;
+void *global_ram2_address = NULL;
+void *global_ram3_address = NULL;
+
+static pthread_t mmap_listen_thrs[NUM_COMM_PAGES];
+static int mmap_listen_thr_started = 0;
+
+
 
 QemuFsType qemu_fd_getfs(int fd)
 {
@@ -178,6 +203,76 @@ static void *mmap_reserve(size_t size, int fd)
 }
 
 /*
+ * Reserve a new memory region at a desired address.
+ *
+ * Without MAP_FIXED_NOREPLACE, @want is only a hint. If the kernel places the
+ * mapping elsewhere, treat it as a failure and unmap the unexpected mapping.
+ */
+static void *mmap_reserve_at(void *want, size_t size, int fd)
+{
+    int flags = MAP_PRIVATE;
+    void *ret;
+
+#if defined(__powerpc64__) && defined(__linux__)
+    if (fd == -1 || qemu_fd_getpagesize(fd) == qemu_real_host_page_size()) {
+        fd = -1;
+        flags |= MAP_ANONYMOUS;
+    } else {
+        flags |= MAP_NORESERVE;
+    }
+#else
+    fd = -1;
+    flags |= MAP_ANONYMOUS;
+#endif
+
+#ifdef MAP_FIXED_NOREPLACE
+    ret = mmap(want, size, PROT_NONE, flags | MAP_FIXED_NOREPLACE, fd, 0);
+    if (ret != MAP_FAILED) {
+        return ret;
+    }
+#endif
+
+    ret = mmap(want, size, PROT_NONE, flags, fd, 0);
+    if (ret == want) {
+        return ret;
+    }
+    if (ret != MAP_FAILED) {
+        munmap(ret, size);
+    }
+    return MAP_FAILED;
+}
+
+/* Really bad heuristic, but it will do for now. */
+int dimm_counter = 0;
+
+/* Track whether we kept a guard page for a given RAM mapping. */
+static GHashTable *guard_len_by_ptr;
+
+static void guard_len_record(void *ptr, size_t guard_len)
+{
+    if (!guard_len_by_ptr) {
+        guard_len_by_ptr = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    /* Store guard_len+1 so that 0 is distinguishable from NULL (not found). */
+    g_hash_table_insert(guard_len_by_ptr, ptr,
+                        (gpointer)(uintptr_t)(guard_len + 1));
+}
+
+static size_t guard_len_lookup(void *ptr, size_t default_guard_len)
+{
+    gpointer v;
+
+    if (!guard_len_by_ptr) {
+        return default_guard_len;
+    }
+    v = g_hash_table_lookup(guard_len_by_ptr, ptr);
+    if (!v) {
+        return default_guard_len;
+    }
+    return (size_t)(uintptr_t)v - 1;
+}
+
+/*
  * Activate memory in a reserved region from the given fd (if any), to make
  * it accessible.
  */
@@ -204,12 +299,23 @@ static void *mmap_activate(void *ptr, size_t size, int fd,
         map_sync_flags = MAP_SYNC | MAP_SHARED_VALIDATE;
     }
 
+    // printf("mmap_activate: ptr=%p; size=%ld; FD=%d; offset=%ld; flags=0x%x\n",
+    //        ptr, size, fd, map_offset, flags | map_sync_flags);
+
     activated_ptr = mmap(ptr, size, prot, flags | map_sync_flags, fd,
                          map_offset);
+    char *proc_link = g_strdup_printf("/proc/self/fd/%d", fd);
+    char *file_name = g_malloc0(PATH_MAX);
+    int len = readlink(proc_link, file_name, PATH_MAX - 1);
+
+    if (len < 0) {
+        len = 0;
+    }
+    file_name[len] = '\0';
     if (activated_ptr == MAP_FAILED && map_sync_flags) {
         if (errno == ENOTSUP) {
-            char *proc_link = g_strdup_printf("/proc/self/fd/%d", fd);
-            char *file_name = g_malloc0(PATH_MAX);
+            proc_link = g_strdup_printf("/proc/self/fd/%d", fd);
+            file_name = g_malloc0(PATH_MAX);
             int len = readlink(proc_link, file_name, PATH_MAX - 1);
 
             if (len < 0) {
@@ -231,6 +337,92 @@ static void *mmap_activate(void *ptr, size_t size, int fd,
          */
         activated_ptr = mmap(ptr, size, prot, flags, fd, map_offset);
     }
+
+#if 1
+    /* TODO: This hardcodes the three DIMM logic. */
+    if (dimm_counter == 0) {
+        log_always("\n");
+        log_always("========BACKEND-SETUP\n");
+        log_always("========DIMM1========\n");
+        if(qemu_map_flags & QEMU_MAP_SHARED){
+            size_t length = 2*1024*1024*1024ULL - 2*1024*1024; // 2GB - 2MB
+            log_always("[native] %p -- %p\n", 
+            activated_ptr, 
+            (void *)((uintptr_t)activated_ptr + length));
+
+            off_t offset = map_offset + (off_t)2*1024*1024;
+            void *want = (void *) VIRTUAL_ADDRESS_LOW;
+            log_always("[identity] %p -- %p)\n", want, (void *)((uintptr_t)want + length));
+
+            void *lowShadow = mmap(want, length, prot, (MAP_SHARED | MAP_FIXED), fd, offset);
+            if (lowShadow == MAP_FAILED){
+                perror("WARNING 1:1 MAPPINGS NOT PRESENT -- mmap LOW FAILED!\n");
+            }
+        }
+        global_ram1_address = activated_ptr;
+        dimm_counter++;
+        
+    } else if (dimm_counter == 1) {
+        log_always("========DIMM2========\n");
+        if(qemu_map_flags & QEMU_MAP_SHARED){
+            // QEMU does not map 2GB-4GB region (MMIO/PCIe space.)
+            size_t length = 2*1024*1024*1024ULL; // 4GB - 2GB
+            log_always("[native] %p -- %p\n", 
+            activated_ptr, 
+            (void *)((uintptr_t)activated_ptr + length));
+
+            off_t offset = map_offset;
+            void *want = (void *) VIRTUAL_ADDRESS_MED;
+            log_always("[identity] %p -- %p)\n", want, (void *)((uintptr_t)want + length));
+
+            if (activated_ptr != want){
+                log_always("activated != want! -- Host allocation isn't identity mapped.");
+                assert(false);
+            }
+        }
+
+        // This should be the global ram address (used by sg-listener)
+        global_ram_address = activated_ptr;
+        global_ram2_address = activated_ptr;
+        dimm_counter++;
+    } else if (dimm_counter == 2) {
+        log_always("========DIMM3========\n");
+        if(qemu_map_flags & QEMU_MAP_SHARED){
+            size_t length = size; 
+            log_always("[native] %p -- %p\n", 
+            activated_ptr, 
+            (void *)((uintptr_t)activated_ptr + length));
+
+            off_t offset = map_offset;
+            void *want = (void *) VIRTUAL_ADDRESS_HIGH;
+            log_always("[identity] %p -- %p)\n", want, (void *)((uintptr_t)want + length));
+
+            if (activated_ptr != want){
+                log_always("activated != want! -- Host allocation isn't identity mapped.");
+                assert(false);
+            }
+        }
+
+        // After ram is mapped, spawn mmap listener thread
+        log_always("[*] Spawing mmap listener thread \n");
+        if (!mmap_listen_thr_started) {
+            mmap_listen_thr_started = 1;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            for (long i = 0; i < NUM_COMM_PAGES; i++) {
+                pthread_create(&mmap_listen_thrs[i], &attr, mmap_listener, (void*)i);
+            }
+            pthread_attr_destroy(&attr);
+        }
+        global_ram3_address = activated_ptr;
+
+        log_always("========BACKEND-SETUP\n\n");
+        dimm_counter++;
+    }
+#endif
+
+    g_free(proc_link);
+    g_free(file_name);
     return activated_ptr;
 }
 
@@ -251,8 +443,13 @@ void *qemu_ram_mmap(int fd,
                     off_t map_offset)
 {
     const size_t guard_pagesize = mmap_guard_pagesize(fd);
+    // printf("qemu_ram_mmap: page size (%lx)\n", qemu_fd_getpagesize(fd));
     size_t offset, total;
     void *ptr, *guardptr;
+    const int dimm_idx = dimm_counter;
+    const bool try_identity_native = (qemu_map_flags & QEMU_MAP_SHARED) &&
+                                    (dimm_idx == 1 || dimm_idx == 2);
+    void *identity_want = NULL;
 
     /*
      * Note: this always allocates at least one extra page of virtual address
@@ -260,7 +457,21 @@ void *qemu_ram_mmap(int fd,
      */
     total = size + align;
 
-    guardptr = mmap_reserve(total, fd);
+    if (try_identity_native) {
+        identity_want = (void *)(dimm_idx == 1 ? VIRTUAL_ADDRESS_MED : VIRTUAL_ADDRESS_HIGH);
+
+        /* If we can't make ptr==want, we'll fall back to the old 2-mapping setup. */
+        if (align && is_power_of_2(align)) {
+            assert(((uintptr_t)identity_want & (align - 1)) == 0);
+        }
+
+        guardptr = mmap_reserve_at(identity_want, total, fd);
+        if (guardptr == MAP_FAILED) {
+            guardptr = mmap_reserve(total, fd);
+        }
+    } else {
+        guardptr = mmap_reserve(total, fd);
+    }
     if (guardptr == MAP_FAILED) {
         return MAP_FAILED;
     }
@@ -291,13 +502,26 @@ void *qemu_ram_mmap(int fd,
         munmap(ptr + size + guard_pagesize, total - size - guard_pagesize);
     }
 
+    /*
+     * For identity-native DIMM2 at 0x100000000, drop its guard page so DIMM3
+     * can start exactly at 0x180000000.
+     */
+    if (try_identity_native && dimm_idx == 1 && ptr == identity_want) {
+        munmap(ptr + size, guard_pagesize);
+        guard_len_record(ptr, 0);
+    } else {
+        guard_len_record(ptr, guard_pagesize);
+    }
+
     return ptr;
 }
 
 void qemu_ram_munmap(int fd, void *ptr, size_t size)
 {
     if (ptr) {
-        /* Unmap both the RAM block and the guard page */
-        munmap(ptr, size + mmap_guard_pagesize(fd));
+        const size_t default_guard = mmap_guard_pagesize(fd);
+        const size_t guard_len = guard_len_lookup(ptr, default_guard);
+        /* Unmap the RAM block and (optionally) the guard page */
+        munmap(ptr, size + guard_len);
     }
 }
