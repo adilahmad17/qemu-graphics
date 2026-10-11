@@ -3,7 +3,8 @@
 QEMU with the Tirith graphics host listener, for use with `gramine-vm` from
 [gramine-multiarch](https://github.com/adilahmad17/gramine-multiarch). x86_64 hosts only.
 
-The Tirith changes are by the ASTERISC Research Lab.
+The Tirith changes are by the ASTERISC Research Lab and are licensed like other QEMU contributions,
+GPL-2.0-or-later (see `LICENSE`).
 
 Based on upstream QEMU commit `94474a7733` (2025-10-09, version 10.1.50). The Tirith changes are:
 

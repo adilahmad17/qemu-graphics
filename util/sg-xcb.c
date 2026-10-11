@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Copyright (C) 2026 The ASTERISC Research Lab */
 
 #define _GNU_SOURCE
