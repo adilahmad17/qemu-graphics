@@ -33,5 +33,8 @@ handshake.
 No install step: point `gramine-vm` at the binary with
 `QEMU_PATH=<this repo>/build/qemu-system-x86_64`.
 
-The listener expects the memory layout that `gramine-vm` sets up (three `memory-backend-memfd`
-objects: 2G, 2G, the rest) and a guest of at least 5G.
+The listener expects the memory layout that `gramine-vm` sets up: the `huge0` backend (2G of memfd
+at guest physical 0, where the kernel and the application live; a second, identity mapping covers
+guest 2M--2G so the comm page is reachable), and the GEM arenas from guest 4G up (backends' guest
+bases arrive in `GRAMINE_RAM_BASES`; a hugepages deployment adds a dedicated 1G hugetlb bucket for
+the hugepage GEM arena at 6G). The floor is guest RAM of 4G (5G with hugepages).
