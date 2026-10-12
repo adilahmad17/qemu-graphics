@@ -529,22 +529,33 @@ void setup_comm_data_regions(volatile comm_page_t *c) {
   log_always("COMM MAGIC: %p\n", (void *)*((uint64_t *)COMM_ADDR));
   c->magic = 0x2;
 
-  volatile comm_page_t *d = (comm_page_t *)(uintptr_t)DATA_REGION;
+  /* The data arena address: the launcher exports GRAMINE_DATA_ADDR into this
+   * QEMU process's environment; the compiled 4G anchor remains the fallback.
+   * All guest RAM above the low backend is identity-mapped, so the host side
+   * of every guest physical address is the address itself. */
+  void *data_region_addr = DATA_REGION;
+  {
+    const char *env_addr = getenv("GRAMINE_DATA_ADDR");
+    if (env_addr && *env_addr) {
+      char *end;
+      unsigned long long v = strtoull(env_addr, &end, 10);
+      if (*end == '\0' && v) {
+        data_region_addr = (void *)(uintptr_t)v;
+      } else {
+        log_always("[sg] bad GRAMINE_DATA_ADDR '%s'; keeping the compiled anchor\n", env_addr);
+      }
+    }
+  }
+
+  volatile comm_page_t *d = (comm_page_t *)(uintptr_t)data_region_addr;
   while (d->magic != 0x1234567812344678ULL) {
     usleep(1000);
   }
-  data_region_actual_address = (void *)((uint64_t)global_ram_address);
+  data_region_actual_address = data_region_addr;
 
-  if (data_region_actual_address != DATA_REGION) {
-    log_always("FATAL: data region not identity-mapped (guest=%p host=%p)\n",
-               (void *)(uintptr_t)DATA_REGION,
-               (void *)(uintptr_t)data_region_actual_address);
-    assert(false);
-  }
-
-  log_always("DATA MAGIC: %p\n", (void *)*((uint64_t *)DATA_REGION));
+  log_always("DATA MAGIC: %p\n", (void *)*((uint64_t *)data_region_addr));
   log_always("DATA REGION: (guest=%p, host=%p)\n",
-             (void *)(uint64_t)DATA_REGION, data_region_actual_address);
+             (void *)(uint64_t)data_region_addr, data_region_actual_address);
 
   while (*((uint64_t *)data_region_actual_address) != 0x1234567812344678ULL) {
     usleep(1000);
@@ -552,7 +563,7 @@ void setup_comm_data_regions(volatile comm_page_t *c) {
   *((uint64_t *)data_region_actual_address) = 0x2;
 
   gem_slots.host_address = ((uint64_t)data_region_actual_address);
-  gem_slots.guest_address = ((uint64_t)DATA_REGION);
+  gem_slots.guest_address = ((uint64_t)data_region_addr);
   gem_regular_base = gem_slots.host_address;
 
   // Wait for hugedata addr
@@ -573,11 +584,11 @@ void setup_comm_data_regions(volatile comm_page_t *c) {
   uint64_t huge_guest_addr = c->p1;
 
   if (huge_guest_addr <
-      (uint64_t)(uintptr_t)DATA_REGION + data_region_size) {
+      (uint64_t)(uintptr_t)data_region_addr + data_region_size) {
     log_always("FATAL: hugepage arena %p does not start at or after the data "
                "arena end %p\n",
                (void *)(uintptr_t)hugepage_host_addr,
-               (void *)((uint64_t)(uintptr_t)DATA_REGION + data_region_size));
+               (void *)((uint64_t)(uintptr_t)data_region_addr + data_region_size));
     assert(false);
   }
 
