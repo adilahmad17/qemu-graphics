@@ -427,8 +427,8 @@ static ioctl_stat *get_ioctl_stat(unsigned long request) {
 struct timespec ts;
 void *data_region_actual_address = NULL;
 void *hugepage_host_addr = NULL;
-size_t data_region_size = DATA_SIZE;
-size_t huge_region_size = HUGE_DATA_SIZE;
+size_t data_region_size = GRAPHICS_GEM_DATA_SIZE;
+size_t huge_region_size = GRAPHICS_GEM_HUGEPAGE_SIZE;
 typedef struct {
   uint64_t host_address;
   uint64_t guest_address;

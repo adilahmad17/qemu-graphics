@@ -5,8 +5,6 @@
 #ifndef QEMU_SG_H
 #define QEMU_SG_H
 
-#define NUM_COMM_PAGES 1
-
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -18,6 +16,18 @@
 #include <EGL/eglext.h>
 #include <xcb/xcb.h>
 #include <xcb/sync.h>
+
+/*
+ * The shared Tirith graphics ABI -- the comm page, the request ids, the common
+ * buffer state and the fallback arena geometry -- defined once in the sibling
+ * gramine-multiarm checkout (libos/include/graphics_comm_abi.h) and resolved by
+ * the build (tirith-build.sh exports GRAMINE_ABI_DIR). Everything the guest
+ * stores into, or this listener serves out of, the comm page comes from there.
+ */
+#include "graphics_comm_abi.h"
+
+/* QEMU-side name for the shared request ids. */
+typedef enum graphics_request RequestType;
 
 /* Uncomment to enable debugging */
 // #define COMMAND_DEBUG
@@ -75,28 +85,16 @@ void set_shared_input_mask(xcb_window_t window, uint32_t event_mask);
 int get_guest_tsc_info(uint64_t *offset, uint32_t *frequency_khz);
 
 extern void* data_region_actual_address;
-/* extern void* global_ram1_address; -- removed with the counter-based placement. */
 
 /* Arena sizes in bytes, sent by the guest during comm-page setup (c->p2 for
- * the data arena, c->p3 for the hugepage arena). The compiled constants below
- * remain the fallback for guests that do not send them. */
+ * the data arena, c->p3 for the hugepage arena); initialized from the compiled
+ * ABI fallbacks. */
 extern size_t data_region_size;
 extern size_t huge_region_size;
-typedef struct {
-    volatile uint64_t magic;
-    volatile uint64_t req_bit;
-    volatile uint64_t ret;
-    volatile uint64_t p1;
-    volatile uint64_t p2;
-    volatile uint64_t p3;
-    volatile uint64_t p4;
-    volatile uint64_t p5;
-} comm_page_t;
 
-_Static_assert(offsetof(comm_page_t, ret) == 16, "SG response must stay in the hot cache line");
-_Static_assert(offsetof(comm_page_t, p5) == 56, "common SG payload must fit one cache line");
-_Static_assert(sizeof(comm_page_t) == 64, "SG communication ABI must fit one cache line");
-
+/* Per-buffer state; mirrors the guest library's `struct buffer` (common.h).
+ * Its layout is part of the ABI -- see graphics_comm_abi.h. */
+#define NUM_BUFFERS 3
 typedef struct buffer {
     struct gbm_bo *bo;
     int bo_fd;
@@ -113,70 +111,17 @@ typedef struct buffer {
     GLuint rbo_depth;
 } check;
 
-typedef enum RequestType {
-    LOG_MMAP_EVENT = 1,
-    SETUP_DATA = 2,
-    GEM_ALLOCATION = 3,
-    FSTAT = 4,
-    IOCTL = 5,
-    OPEN = 6,
-    FCNTL = 7,
-    READLINK = 8,
-    NEWFSTAT = 9,
-    GETDENT = 10,
-    DUP = 11,
-    DUP_IDENTITY = 30,
-    X11_SETUP = 12,
-    X11_PRESENT = 13,
-    X11_IDLE_FENCE_BUFFER = 33,
-    CLOSE = 14,
-    SYSCALL_LOGGING_ENABLE = 15,
-    SYSCALL_LOGGING_DISABLE = 16,
-    LSEEK = 22,
-    UPDATE_WINDOW_SIZE = 23,
-    READ = 24,
-    WRITE = 25,
-    SYSV_SEMGET = 34,
-    SYSV_SEMCTL = 35,
-    SYSV_SEMOP = 36,
-    HOST_FLOCK = 37,
-    HOST_FTRUNCATE = 38,
-    UPDATE_INPUT_MASK = 39,
-} RequestType;
-
-// Sizes
-static const size_t THREE_GIGABYTES = 3ULL * 1024 * 1024 * 1024;
-static const size_t ONE_GIGABYTE = 1ULL * 1024 * 1024 * 1024;
-/* The regular arena occupies [4GiB, 7GiB), and the hugepage arena occupies [8GiB, 9GiB).
- * A 16GiB VM still leaves ample space above both ranges for LibOS and application mappings. */
-static const size_t DATA_SIZE      = THREE_GIGABYTES;
-static const size_t HUGE_DATA_SIZE = ONE_GIGABYTE;
-static const  size_t PAGE_SIZE    = 4*1024;
-
-#define COMM_ADDR  0xf00000ULL
-#define COMM_MAGIC 0x1234567812345678ULL
-
-/* Data arena: guest physical [DATA_REGION, DATA_REGION + size). The size is
- * configured by the manifest as sys.experimental__graphics_data_size, sent by
- * the guest in the comm page setup (c->p2), and adopted at runtime. DATA_REGION
- * itself stays fixed: the host waits for the data magic there. */
-static void* DATA_REGION = (void*)0x100000000ULL;
-
-/* Hugepage arena: guest physical address is computed by the guest as
- * DATA_REGION + data size and sent in the comm page setup (c->p1); the size
- * arrives in c->p3. All guest RAM is identity-mapped, so the host address
- * equals the guest physical address. */
+/* Fallback arena anchors; the runtime addresses live in
+ * `data_region_actual_address`/`hugepage_host_addr` (sg-listener.c). */
+static void* DATA_REGION = (void*)GRAPHICS_GEM_DATA_START;
 static void* UNMAP_DATA_MSG = (void*)0x1234567f1234567fULL;
-
 
 void* mmap_listener(void* arg);
 
-// #define WIDTH 1280
-// #define HEIGHT 720
 extern int win_width;
 extern int win_height;
 
-#define NUM_BUFFERS 3
+static const size_t PAGE_SIZE = 4 * 1024;
 
 #define sys_exec_vmexits 549
 #define sys_sg_vmexits_printreset 550

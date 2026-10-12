@@ -15,14 +15,17 @@ Based on upstream QEMU commit `94474a7733` (2025-10-09, version 10.1.50). The Ti
 | `util/sg-xcb.c`, `util/input_ring.h` | host-side X11 presentation and input forwarding; copies of `xcb.c` and `input_ring.h` from the Gramine tree's preload library (`libos/src/graphics`, built as `libgraphics.so`; Tirith's `egl-redirect`) |
 | `util/meson.build` | builds the above and links the xcb libraries |
 
-The comm-page layout and request ids in `include/qemu/sg.h` must match
-`libos/include/libos_graphics.h` and `libos/src/graphics/common.h` in the Gramine tree. The arena
-geometry (data-arena size, hugepage arena address) travels at runtime: the PAL reserves the ranges
-from an fw_cfg file the Gramine launcher injects (`opt/gramine/graphics_data_size`, bytes of
-`GRAMINE_DATA_SIZE`), and the guest ships the same values to the listener in the comm-page setup
-(`c->p1`..`p3`). The listener only relies on the data arena starting at `DATA_REGION` (4G) and the
-hugepage arena starting at its end; both host and guest sides of those invariants come from that
-handshake.
+The comm-page layout and request ids are defined **once**, in the Gramine tree
+(`libos/include/graphics_comm_abi.h`); this build resolves it from the sibling checkout
+(`tirith-build.sh` exports `GRAMINE_ABI_DIR`), as it does for `input_ring.h` (that tree's
+`libos/src/graphics/`). The only remaining copy is `util/sg-xcb.c`, kept identical to the Gramine
+tree's `libos/src/graphics/xcb.c` apart from the GPL license header line; the build fails if the
+two drift. The arena geometry (data-arena size, data-arena address, hugepage arena address)
+travels at runtime: the PAL reserves the ranges from fw_cfg files the Gramine launcher injects
+(`opt/gramine/graphics_data_size`, `graphics_data_addr`, `graphics_huge_addr` -- the byte values
+of `GRAMINE_DATA_SIZE`, `GRAMINE_DATA_ADDR`, `GRAMINE_HUGEPAGE_ADDR`), and the guest ships the
+same values to the listener in the comm-page setup (`c->p1`..`p3`). The listener only relies on
+the hugepage arena starting at the end of the data arena.
 
 ## Build
 
