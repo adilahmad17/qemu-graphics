@@ -37,9 +37,6 @@
 // static const size_t LOW_OFFSET_INTO_MEMORY = 0x100000ULL;           // 1MB
 // static const void *VIRTUAL_ADDRESS_LOW = (void*)0x100000ULL;        // 1MB
 static const void *VIRTUAL_ADDRESS_LOW = (void*)0x200000ULL;        // 2MB
-static const void *VIRTUAL_ADDRESS_MED = (void*)0x100000000ULL;        // 4GB
-static const void *VIRTUAL_ADDRESS_HIGH = (void*)0x180000000ULL;    // 6GB
-static const void *VIRTUAL_ADDRESS_HIGH2 = (void*)0x1C0000000ULL;   // 7GB
 
 /* Boot-time instrumentation: t0 is taken at the first RAM backend placement so
  * the [boot] stamps can be compared with the guest-side ones. */
@@ -48,15 +45,49 @@ static inline int64_t boot_elapsed_us(void) {
     return g_get_monotonic_time() - boot_t0_us;
 }
 
+/* gramine-vm exports GRAMINE_RAM_BASES: the guest-physical base of every memfd
+ * backend, comma-separated decimals in -object order (QEMU places -numa node 0
+ * at physical 0 and every later node sequentially from 4G). With the list, the
+ * identity-native placement follows it per backend and the mmap listener starts
+ * once the last of them is in; without it, the built-in anchors apply.
+ * Non-memfd RAM blocks are not part of the map and are skipped. */
+static uint64_t ram_bases[32];
+static int ram_bases_count = 0;
+static bool ram_bases_parsed = false;
+
+static void ram_bases_init(void) {
+    if (ram_bases_parsed) {
+        return;
+    }
+    ram_bases_parsed = true;
+    const char *env = getenv("GRAMINE_RAM_BASES");
+    if (!env || !*env) {
+        return;
+    }
+    char **parts = g_strsplit(env, ",", -1);
+    for (char **p = parts; p && *p; p++) {
+        if (ram_bases_count >= (int)G_N_ELEMENTS(ram_bases)) {
+            ram_bases_count = 0;
+            log_always("[sg] GRAMINE_RAM_BASES has too many entries; using the built-in anchors\n");
+            break;
+        }
+        char *end;
+        uint64_t v = g_ascii_strtoull(*p, &end, 10);
+        if (end == *p || *end != '\0') {
+            ram_bases_count = 0;
+            log_always("[sg] bad GRAMINE_RAM_BASES entry '%s'; using the built-in anchors\n", *p);
+            break;
+        }
+        ram_bases[ram_bases_count++] = v;
+    }
+    g_strfreev(parts);
+}
+
 static const size_t LOW_OFFSET_INTO_MEMORY = 0x40000000ULL;           // 1MB
 // static const void *VIRTUAL_ADDRESS_LOW = (void*)0x40000000ULL;        // 1MB
 static const size_t HIGH_OFFSET_INTO_MEMORY = 0x80000000ULL;        // 2GB
 // static const void *VIRTUAL_ADDRESS_HIGH = (void*)0x100000000ULL;    // 4GB
 // static const void *VIRTUAL_ADDRESS_HIGH = (void*)0x140000000ULL;    // 5GB
-void *global_ram_address = NULL;
-void *global_ram1_address = NULL;
-void *global_ram2_address = NULL;
-void *global_ram3_address = NULL;
 
 static pthread_t mmap_listen_thrs[NUM_COMM_PAGES];
 static int mmap_listen_thr_started = 0;
@@ -347,135 +378,99 @@ static void *mmap_activate(void *ptr, size_t size, int fd,
     }
 
 #if 1
-    /* TODO: This hardcodes the backend logic (low backend + identity-native
-     * upper backends; a hugetlb deployment adds a fourth backend for the
-     * hugepage GEM bucket). */
+    /* The guest-physical placement of the gramine-vm memory map; see the
+     * GRAMINE_RAM_BASES comment at ram_bases_init() above. */
     if (boot_t0_us < 0) {
         boot_t0_us = g_get_monotonic_time();
     }
-    if (dimm_counter == 0) {
+    ram_bases_init();
+    const bool have_bases = ram_bases_count > 0;
+    const int nbases = ram_bases_count ? ram_bases_count : 3;
+
+    if (!(qemu_map_flags & QEMU_MAP_SHARED)) {
+        /* QEMU's non-memfd RAM blocks are not part of the launcher's map. */
+    } else if (have_bases && dimm_counter >= ram_bases_count) {
+        /* more memfd backends than the launcher announced -- ignore */
+    } else if (dimm_counter == 0) {
         log_always("\n");
         log_always("========BACKEND-SETUP\n");
         log_always("========DIMM1========\n");
-        if(qemu_map_flags & QEMU_MAP_SHARED){
-            size_t length = 2*1024*1024*1024ULL - 2*1024*1024; // 2GB - 2MB
-            log_always("[native] %p -- %p\n", 
-            activated_ptr, 
-            (void *)((uintptr_t)activated_ptr + length));
+        size_t length = 2*1024*1024*1024ULL - 2*1024*1024; // 2GB - 2MB
+        log_always("[native] %p -- %p\n",
+        activated_ptr,
+        (void *)((uintptr_t)activated_ptr + length));
 
-            off_t offset = map_offset + (off_t)2*1024*1024;
-            void *want = (void *) VIRTUAL_ADDRESS_LOW;
-            log_always("[identity] %p -- %p)\n", want, (void *)((uintptr_t)want + length));
+        off_t offset = map_offset + (off_t)2*1024*1024;
+        void *want = (void *) VIRTUAL_ADDRESS_LOW;
+        log_always("[identity] %p -- %p)\n", want, (void *)((uintptr_t)want + length));
 
-            void *lowShadow = mmap(want, length, prot, (MAP_SHARED | MAP_FIXED), fd, offset);
-            if (lowShadow == MAP_FAILED){
-                perror("WARNING 1:1 MAPPINGS NOT PRESENT -- mmap LOW FAILED!\n");
-            }
+        void *lowShadow = mmap(want, length, prot, (MAP_SHARED | MAP_FIXED), fd, offset);
+        if (lowShadow == MAP_FAILED){
+            perror("WARNING 1:1 MAPPINGS NOT PRESENT -- mmap LOW FAILED!\n");
         }
-        global_ram1_address = activated_ptr;
-        log_always("[boot] low backend placed +%ld ms\n", (long)(boot_elapsed_us() / 1000));
+        log_always("[boot] backend 0 (low) placed +%ld ms\n", (long)(boot_elapsed_us() / 1000));
         dimm_counter++;
+    } else {
+        /* identity-native upper backend */
+        const uint64_t want_addr = have_bases
+            ? ram_bases[dimm_counter]
+            : (dimm_counter == 1 ? 0x100000000ULL
+               : dimm_counter == 2 ? 0x180000000ULL
+                                   : 0x1C0000000ULL);
+        log_always("========DIMM%d========\n", dimm_counter + 1);
+        log_always("[native] %p -- %p\n",
+        activated_ptr,
+        (void *)((uintptr_t)activated_ptr + size));
 
-    } else if (dimm_counter == 1) {
-        log_always("========DIMM2========\n");
-        if(qemu_map_flags & QEMU_MAP_SHARED){
-            // QEMU does not map 2GB-4GB region (MMIO/PCIe space.)
-            size_t length = 2*1024*1024*1024ULL; // 4GB - 2GB
-            log_always("[native] %p -- %p\n", 
-            activated_ptr, 
-            (void *)((uintptr_t)activated_ptr + length));
+        void *want = (void *)(uintptr_t)want_addr;
+        log_always("[identity] %p -- %p)\n", want, (void *)((uintptr_t)want + size));
 
-            off_t offset = map_offset;
-            void *want = (void *) VIRTUAL_ADDRESS_MED;
-            log_always("[identity] %p -- %p)\n", want, (void *)((uintptr_t)want + length));
-
-            if (activated_ptr != want){
-                log_always("activated != want! -- Host allocation isn't identity mapped.");
-                assert(false);
-            }
+        if (activated_ptr != want){
+            log_always("activated != want! -- Host allocation isn't identity mapped.");
+            assert(false);
         }
 
-        // This should be the global ram address (used by sg-listener)
-        global_ram_address = activated_ptr;
-        global_ram2_address = activated_ptr;
-        log_always("[boot] backend 1 placed +%ld ms\n", (long)(boot_elapsed_us() / 1000));
-        dimm_counter++;
-    } else if (dimm_counter == 2) {
-        log_always("========DIMM3========\n");
-        if(qemu_map_flags & QEMU_MAP_SHARED){
-            size_t length = size; 
-            log_always("[native] %p -- %p\n", 
-            activated_ptr, 
-            (void *)((uintptr_t)activated_ptr + length));
-
-            off_t offset = map_offset;
-            void *want = (void *) VIRTUAL_ADDRESS_HIGH;
-            log_always("[identity] %p -- %p)\n", want, (void *)((uintptr_t)want + length));
-
-            if (activated_ptr != want){
-                log_always("activated != want! -- Host allocation isn't identity mapped.");
-                assert(false);
-            }
-        }
-
-        // After ram is mapped, spawn mmap listener thread
-        log_always("[*] Spawing mmap listener thread \n");
-        if (!mmap_listen_thr_started) {
-            mmap_listen_thr_started = 1;
-            pthread_attr_t attr;
-            pthread_attr_init(&attr);
-            for (long i = 0; i < NUM_COMM_PAGES; i++) {
-                pthread_create(&mmap_listen_thrs[i], &attr, mmap_listener, (void*)i);
-            }
-            pthread_attr_destroy(&attr);
-        }
-
-        /* [mem] Host memory picture once all three backends are placed:
-         * VmPeak/VmSize reflect the identity mappings and the low shadow. */
-        {
-            long vmpeak = -1, vmsize = -1, vmrss = -1;
-            FILE *f = fopen("/proc/self/status", "r");
-            if (f) {
-                char line[128];
-                while (fgets(line, sizeof(line), f)) {
-                    if (!strncmp(line, "VmPeak:", 7)) {
-                        vmpeak = atol(line + 7);
-                    } else if (!strncmp(line, "VmSize:", 7)) {
-                        vmsize = atol(line + 7);
-                    } else if (!strncmp(line, "VmRSS:", 6)) {
-                        vmrss = atol(line + 6);
-                    }
+        if (dimm_counter + 1 >= nbases) {
+            /* last memfd backend: everything the listener polls (the comm page
+             * and the arena addresses) is mapped once the guest starts; spawn it */
+            log_always("[*] Spawing mmap listener thread \n");
+            if (!mmap_listen_thr_started) {
+                mmap_listen_thr_started = 1;
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
+                for (long i = 0; i < NUM_COMM_PAGES; i++) {
+                    pthread_create(&mmap_listen_thrs[i], &attr, mmap_listener, (void*)i);
                 }
-                fclose(f);
+                pthread_attr_destroy(&attr);
             }
-            log_always("[mem] host VmPeak=%ld kB VmSize=%ld kB VmRSS=%ld kB\n",
-                       vmpeak, vmsize, vmrss);
-        }
 
-        global_ram3_address = activated_ptr;
-        log_always("[boot] backend 2 placed +%ld ms\n", (long)(boot_elapsed_us() / 1000));
-        log_always("========BACKEND-SETUP\n\n");
-        dimm_counter++;
-    } else if (dimm_counter == 3) {
-        /* Fourth backend: the normal-pages app RAM that follows the hugetlb
-         * GEM bucket in a hugepages deployment. Identity-native like the
-         * others; the listener already runs (it was started at backend 2). */
-        log_always("========DIMM4========\n");
-        if (qemu_map_flags & QEMU_MAP_SHARED) {
-            size_t length = size;
-            log_always("[native] %p -- %p\n",
-            activated_ptr,
-            (void *)((uintptr_t)activated_ptr + length));
-
-            off_t offset = map_offset;
-            void *want = (void *) VIRTUAL_ADDRESS_HIGH2;
-            log_always("[identity] %p -- %p)\n", want, (void *)((uintptr_t)want + length));
-
-            if (activated_ptr != want) {
-                log_always("activated != want! -- Host allocation isn't identity mapped.");
-                assert(false);
+            /* [mem] Host memory picture with the full map in place. */
+            {
+                long vmpeak = -1, vmsize = -1, vmrss = -1;
+                FILE *f = fopen("/proc/self/status", "r");
+                if (f) {
+                    char line[128];
+                    while (fgets(line, sizeof(line), f)) {
+                        if (!strncmp(line, "VmPeak:", 7)) {
+                            vmpeak = atol(line + 7);
+                        } else if (!strncmp(line, "VmSize:", 7)) {
+                            vmsize = atol(line + 7);
+                        } else if (!strncmp(line, "VmRSS:", 6)) {
+                            vmrss = atol(line + 6);
+                        }
+                    }
+                    fclose(f);
+                }
+                log_always("[mem] host VmPeak=%ld kB VmSize=%ld kB VmRSS=%ld kB\n",
+                           vmpeak, vmsize, vmrss);
             }
-            log_always("[boot] backend 3 placed +%ld ms\n", (long)(boot_elapsed_us() / 1000));
+
+            log_always("[boot] backend %d (last) placed +%ld ms\n", dimm_counter,
+                       (long)(boot_elapsed_us() / 1000));
+            log_always("========BACKEND-SETUP\n\n");
+        } else {
+            log_always("[boot] backend %d placed +%ld ms\n", dimm_counter,
+                       (long)(boot_elapsed_us() / 1000));
         }
         dimm_counter++;
     }
@@ -507,9 +502,19 @@ void *qemu_ram_mmap(int fd,
     size_t offset, total;
     void *ptr, *guardptr;
     const int dimm_idx = dimm_counter;
-    const bool try_identity_native = (qemu_map_flags & QEMU_MAP_SHARED) &&
-                                    (dimm_idx >= 1 && dimm_idx <= 3);
+    ram_bases_init();
+    const bool have_bases = ram_bases_count > 0;
+    const bool try_identity_native = (qemu_map_flags & QEMU_MAP_SHARED) && dimm_idx >= 1 &&
+        (!have_bases || dimm_idx < ram_bases_count);
     void *identity_want = NULL;
+    /* Without the launcher's base list, the original anchors apply. */
+    if (try_identity_native) {
+        identity_want = (void *)(uintptr_t)(
+            have_bases ? ram_bases[dimm_idx]
+                       : (dimm_idx == 1 ? 0x100000000ULL
+                          : dimm_idx == 2 ? 0x180000000ULL
+                                          : 0x1C0000000ULL));
+    }
 
     /*
      * Note: this always allocates at least one extra page of virtual address
@@ -518,10 +523,6 @@ void *qemu_ram_mmap(int fd,
     total = size + align;
 
     if (try_identity_native) {
-        identity_want = (void *)(dimm_idx == 1 ? VIRTUAL_ADDRESS_MED :
-                                 dimm_idx == 2 ? VIRTUAL_ADDRESS_HIGH :
-                                                 VIRTUAL_ADDRESS_HIGH2);
-
         /* If we can't make ptr==want, we'll fall back to the old 2-mapping setup. */
         if (align && is_power_of_2(align)) {
             assert(((uintptr_t)identity_want & (align - 1)) == 0);
@@ -568,11 +569,11 @@ void *qemu_ram_mmap(int fd,
      * For identity-native DIMM2 at 0x100000000, drop its guard page so DIMM3
      * can start exactly at 0x180000000.
      */
-    if (try_identity_native && dimm_idx <= 2 && ptr == identity_want) {
-        /* Leave no guard page, so the next identity-native backend can start
-         * exactly at its base: DIMM3 follows DIMM2 at 6G, and in a hugepages
-         * deployment the fourth backend follows the hugetlb bucket at 7G.
-         * The last backend keeps its guard. */
+    /* Leave no guard page where another identity-native backend follows, so it can
+     * start exactly at its base; the last backend keeps its guard. */
+    const bool another_identity_follows =
+        have_bases ? dimm_idx + 1 < ram_bases_count : dimm_idx <= 2;
+    if (try_identity_native && another_identity_follows && ptr == identity_want) {
         munmap(ptr + size, guard_pagesize);
         guard_len_record(ptr, 0);
     } else {

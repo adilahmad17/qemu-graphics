@@ -75,10 +75,7 @@ void set_shared_input_mask(xcb_window_t window, uint32_t event_mask);
 int get_guest_tsc_info(uint64_t *offset, uint32_t *frequency_khz);
 
 extern void* data_region_actual_address;
-extern void* global_ram_address;
-extern void* global_ram1_address;
-extern void* global_ram2_address;
-extern void* global_ram3_address;
+/* extern void* global_ram1_address; -- removed with the counter-based placement. */
 
 /* Arena sizes in bytes, sent by the guest during comm-page setup (c->p2 for
  * the data arena, c->p3 for the hugepage arena). The compiled constants below
