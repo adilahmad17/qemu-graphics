@@ -845,8 +845,10 @@ extern void *mmap_listener(void *arg) {
     c->magic = 0x2;
   }
 
-  void *curr_host_addr = NULL;
-  void *curr_guest_addr = NULL;
+  /* slots 1 and up: how long a slot spins after a request before it polls every 50 us
+   * (TIRITH_SLOT_IDLE_US, default 2000) */
+  const char *idle_env = getenv("TIRITH_SLOT_IDLE_US");
+  long slot_idle_us = idle_env ? atol(idle_env) : 2000;
 
   /*
    * Event Processing loop
@@ -895,7 +897,7 @@ extern void *mmap_listener(void *arg) {
           break;
         clock_gettime(CLOCK_MONOTONIC, &now);
         long idle_us = (now.tv_sec - last.tv_sec) * 1000000L + (now.tv_nsec - last.tv_nsec) / 1000;
-        if (idle_us > 2000)
+        if (idle_us > slot_idle_us)
           usleep(50);
       }
     }
