@@ -517,6 +517,17 @@ int get_guest_tsc_info(uint64_t *offset, uint32_t *frequency_khz) {
   return 0;
 }
 
+/* The value a forwarded system call returns to the guest: the result, or -errno on failure (the
+ * guest LibOS hands it to the application as the system call's return value). */
+static inline uint64_t host_ret(long ret) {
+  return ret < 0 ? (uint64_t)(int64_t)-errno : (uint64_t)ret;
+}
+
+/* The same for calls that return a host fd, which the guest sees shifted by fs_offset. */
+static inline uint64_t host_fd_ret(long ret) {
+  return ret < 0 ? (uint64_t)(int64_t)-errno : (uint64_t)ret + fs_offset;
+}
+
 static inline void complete_request(volatile comm_page_t *c) {
   __atomic_store_n(&c->req_bit, 0, __ATOMIC_RELEASE);
 }
@@ -799,7 +810,7 @@ extern void *mmap_listener(void *arg) {
 
     case FSTAT:
       ret = fstat(c->p1 - fs_offset, (struct stat *)c->p2);
-      c->ret = ret;
+      c->ret = host_ret((long)ret);
       log_sg("[syscall] fstat(%d, %p) = %ld\n", c->p1, (void *)c->p2, ret);
       complete_request(c);
       break;
@@ -813,7 +824,22 @@ extern void *mmap_listener(void *arg) {
 
       // /* Log the time it takes for the IOCTLs */
       // clock_gettime(CLOCK_MONOTONIC_RAW, &start_ts);
-      ret = ioctl(c->p1 - fs_offset, c->p2, (void *)c->p3);
+      /* A deadline the guest made relative to its own clock (see GRAPHICS_IOCTL_TIME_REL_MAGIC):
+       * move it onto this host's CLOCK_MONOTONIC. The guest restores the field afterwards. */
+      if (c->p5 == GRAPHICS_IOCTL_TIME_REL_MAGIC && c->p4) {
+        int64_t *field = (int64_t *)(uintptr_t)(c->p3 + c->p4 - 1);
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t host_now = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+        int64_t rel = *field;
+        int64_t abs_deadline;
+        if (rel <= 0)
+          abs_deadline = host_now;
+        else if (__builtin_add_overflow(host_now, rel, &abs_deadline))
+          abs_deadline = INT64_MAX;
+        *field = abs_deadline;
+      }
+      ret = host_ret(ioctl(c->p1 - fs_offset, c->p2, (void *)c->p3));
       // clock_gettime(CLOCK_MONOTONIC_RAW, &end_ts);
 
       // uint64_t start_ns = (uint64_t)start_ts.tv_sec * 1000000000ULL +
@@ -934,10 +960,10 @@ extern void *mmap_listener(void *arg) {
 
     case FCNTL:
       ret = fcntl(c->p1 - fs_offset, c->p2, c->p3);
-      if (c->p2 == F_DUPFD_CLOEXEC) {
-        c->ret = ret + fs_offset;
+      if (c->p2 == F_DUPFD_CLOEXEC || c->p2 == F_DUPFD) {
+        c->ret = host_fd_ret((long)ret);
       } else {
-        c->ret = ret;
+        c->ret = host_ret((long)ret);
       }
       log_sg("[syscall] fcntl(%d, %d, 0x%lx) = %ld\n", c->p1, c->p2, c->p3,
              ret);
@@ -960,15 +986,15 @@ extern void *mmap_listener(void *arg) {
 
     case LSEEK:
       ret = lseek(c->p1 - fs_offset, c->p2, c->p3);
-      c->ret = ret;
+      c->ret = host_ret((long)ret);
       log_sg("[syscall] lseek(%d, %d, 0x%lx) = %ld\n", c->p1, c->p2, c->p3,
              ret);
       complete_request(c);
       break;
 
     case READLINK:
-      ret = readlink((const char *)c->p1, (const char *)c->p2, c->p3);
-      c->ret = ret;
+      ret = readlink((const char *)c->p1, (char *)c->p2, c->p3);
+      c->ret = host_ret((long)ret);
       log_sg("[syscall] readlink(\"%s\", %p, %zu) = %zd\n", (const char *)c->p1,
              (void *)c->p2, c->p3, ret);
       complete_request(c);
@@ -977,14 +1003,14 @@ extern void *mmap_listener(void *arg) {
     case NEWFSTAT:
       ret = fstatat(c->p1 - fs_offset, (const char *)c->p2,
                     (struct stat *)c->p3, c->p4);
-      c->ret = ret;
+      c->ret = host_ret((long)ret);
       complete_request(c);
       log_sg("[syscall] newfstat(%d, %p) = %d\n", c->p1, (void *)c->p3, ret);
       break;
 
     case GETDENT:
       ret = syscall(SYS_getdents64, c->p1 - fs_offset, c->p2, c->p3);
-      c->ret = ret;
+      c->ret = host_ret((long)ret);
       complete_request(c);
       log_sg("[syscall] getdents64(%d, %p, %zu) = %zd\n", c->p1, c->p2, c->p3,
              ret);
@@ -992,14 +1018,14 @@ extern void *mmap_listener(void *arg) {
 
     case DUP:
       ret = dup(c->p1 - fs_offset);
-      c->ret = ret + fs_offset;
+      c->ret = host_fd_ret((long)ret);
       log_sg("[syscall] dup(%d) = %d\n", c->p1, ret);
       complete_request(c);
       break;
 
     case DUP_IDENTITY:
       ret = dup(c->p1);
-      c->ret = ret + fs_offset;
+      c->ret = host_fd_ret((long)ret);
       log_sg("[syscall] dup(%d) = %d\n", c->p1, ret);
       complete_request(c);
       break;
@@ -1051,7 +1077,8 @@ extern void *mmap_listener(void *arg) {
       break;
 
     case CLOSE:
-      close(c->p1 - 500);
+      ret = close(c->p1 - fs_offset);
+      c->ret = host_ret((long)ret);
       log_sg("[syscall] close(%d) = %d\n", c->p1, ret);
       complete_request(c);
       break;
@@ -1078,15 +1105,15 @@ extern void *mmap_listener(void *arg) {
       break;
 
     case READ:
-      ret = read(c->p1 - 500, (void *)(uintptr_t)c->p2, c->p3);
-      c->ret = ret;
+      ret = read(c->p1 - fs_offset, (void *)(uintptr_t)c->p2, c->p3);
+      c->ret = host_ret((long)ret);
       log_sg("[syscall] read(%d, %d, %d) = %d\n", c->p1, c->p2, c->p3, ret);
       complete_request(c);
       break;
 
     case WRITE:
-      ret = write(c->p1 - 500, (const void *)(uintptr_t)c->p2, c->p3);
-      c->ret = ret;
+      ret = write(c->p1 - fs_offset, (const void *)(uintptr_t)c->p2, c->p3);
+      c->ret = host_ret((long)ret);
       log_sg("[syscall] write(%d, 0x%lx, %d) = %d\n", c->p1, c->p2, c->p3, ret);
       complete_request(c);
       break;
