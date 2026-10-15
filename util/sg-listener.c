@@ -483,6 +483,198 @@ static inline bool gem_bucket_has_capacity(const gem_slots_t *slots,
   return slots->host_address + size < region_base + region_size;
 }
 
+
+/*
+ * The GEM arenas: guest-physical (= host-virtual) ranges where device mappings replace guest RAM.
+ * Sizes that are a multiple of 2 MiB go to the hugepage arena, others to the regular one, with a
+ * fallback to the other arena when one is full. Freed ranges (GEM_FREE, from the guest's munmap)
+ * go back to a free list per arena and are reused first-fit; the device mapping there is replaced
+ * by anonymous memory, so the host range stays valid for KVM. Regular allocations keep their
+ * trailing guard page (as before); it is freed with the allocation's last page. When neither arena
+ * has room, the guest's mmap fails with ENOMEM instead of QEMU aborting.
+ */
+#define GEM_FREE_MAX 8192
+#define GEM_HUGE_ALIGN 0x200000ULL
+typedef struct {
+  uint64_t start, end;
+} gem_range_t;
+typedef struct {
+  gem_range_t r[GEM_FREE_MAX];
+  int n;
+} gem_free_list_t;
+static gem_free_list_t gem_free_regular, gem_free_huge;
+/* regular allocations: mapped end -> guard page end, so a free of the last page frees the guard */
+typedef struct {
+  uint64_t mapped_end, guard_end;
+} gem_guard_t;
+static gem_guard_t *gem_guards;
+static size_t gem_guards_n, gem_guards_cap;
+
+static void gem_free_list_add(gem_free_list_t *fl, uint64_t start, uint64_t end) {
+  if (start >= end)
+    return;
+  int i = 0;
+  while (i < fl->n && fl->r[i].start < start)
+    i++;
+  /* merge with the previous and the next range where they touch */
+  if (i > 0 && fl->r[i - 1].end >= start) {
+    if (end > fl->r[i - 1].end)
+      fl->r[i - 1].end = end;
+    i--;
+  } else {
+    if (fl->n == GEM_FREE_MAX) {
+      log_always("[mem] GEM free list full; 0x%lx bytes not reused\n", end - start);
+      return;
+    }
+    memmove(&fl->r[i + 1], &fl->r[i], (fl->n - i) * sizeof(fl->r[0]));
+    fl->r[i].start = start;
+    fl->r[i].end = end;
+    fl->n++;
+  }
+  while (i + 1 < fl->n && fl->r[i + 1].start <= fl->r[i].end) {
+    if (fl->r[i + 1].end > fl->r[i].end)
+      fl->r[i].end = fl->r[i + 1].end;
+    memmove(&fl->r[i + 1], &fl->r[i + 2], (fl->n - i - 2) * sizeof(fl->r[0]));
+    fl->n--;
+  }
+}
+
+static bool gem_free_list_take(gem_free_list_t *fl, uint64_t size, uint64_t align,
+                               uint64_t *out) {
+  for (int i = 0; i < fl->n; i++) {
+    uint64_t a = (fl->r[i].start + align - 1) & ~(align - 1);
+    if (a < fl->r[i].start || a + size > fl->r[i].end)
+      continue;
+    uint64_t s = fl->r[i].start, e = fl->r[i].end;
+    /* remove [a, a+size) from the range, keeping what is left on both sides */
+    memmove(&fl->r[i], &fl->r[i + 1], (fl->n - i - 1) * sizeof(fl->r[0]));
+    fl->n--;
+    gem_free_list_add(fl, s, a);
+    gem_free_list_add(fl, a + size, e);
+    *out = a;
+    return true;
+  }
+  return false;
+}
+
+static bool gem_bump(gem_slots_t *slots, uint64_t region_base, uint64_t region_size,
+                     uint64_t size, uint64_t *out) {
+  if (!gem_bucket_has_capacity(slots, size, region_base, region_size))
+    return false;
+  *out = slots->host_address;
+  slots->host_address += size;
+  slots->guest_address += size;
+  return true;
+}
+
+/* Finds room for `size` bytes (the mapping plus, in the regular arena, its guard page). */
+static bool gem_find(uint64_t size, bool huge, uint64_t *out, uint64_t *reserved) {
+  uint64_t regular_size = gem_regular_advance(size);
+  uint64_t huge_base = (uint64_t)(uintptr_t)hugepage_host_addr;
+  uint64_t regular_base = (uint64_t)(uintptr_t)data_region_actual_address;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    bool h = attempt == 0 ? huge : !huge;
+    if (h) {
+      if (gem_free_list_take(&gem_free_huge, size, GEM_HUGE_ALIGN, out) ||
+          gem_bump(&gem_hugepage_slots, huge_base, huge_region_size, size, out)) {
+        *reserved = size;
+        gem_report_peak("hugepage", &gem_hugepage_peak, gem_hugepage_base,
+                        gem_hugepage_slots.host_address, huge_region_size);
+        return true;
+      }
+    } else {
+      if (gem_free_list_take(&gem_free_regular, regular_size, PAGE_SIZE, out) ||
+          gem_bump(&gem_slots, regular_base, data_region_size, regular_size, out)) {
+        *reserved = regular_size;
+        gem_report_peak("regular", &gem_regular_peak, gem_regular_base,
+                        gem_slots.host_address, data_region_size);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool gem_in_huge(uint64_t addr) {
+  uint64_t base = (uint64_t)(uintptr_t)hugepage_host_addr;
+  return addr >= base && addr < base + huge_region_size;
+}
+
+static bool gem_in_regular(uint64_t addr) {
+  uint64_t base = (uint64_t)(uintptr_t)data_region_actual_address;
+  return addr >= base && addr < base + data_region_size;
+}
+
+static uint64_t gem_allocate(uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd,
+                             uint64_t offset) {
+  if (!size)
+    return (uint64_t)(int64_t)-EINVAL;
+  size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+  uint64_t addr, reserved;
+  pthread_mutex_lock(&gem_slots_lock);
+  bool found = gem_find(size, size % GEM_HUGE_ALIGN == 0, &addr, &reserved);
+  pthread_mutex_unlock(&gem_slots_lock);
+  if (!found) {
+    log_always("[mem] GEM arenas full: no room for 0x%lx bytes; the guest's mmap gets ENOMEM\n",
+               size);
+    return (uint64_t)(int64_t)-ENOMEM;
+  }
+  void *p = mmap((void *)(uintptr_t)addr, size, prot, flags | MAP_SHARED | MAP_FIXED,
+                 fd - fs_offset, offset);
+  if (p == MAP_FAILED) {
+    int err = errno;
+    log_always("[mem] GEM mapping of 0x%lx bytes at 0x%lx failed: %s\n", size, addr,
+               strerror(err));
+    pthread_mutex_lock(&gem_slots_lock);
+    gem_free_list_add(gem_in_huge(addr) ? &gem_free_huge : &gem_free_regular, addr,
+                      addr + reserved);
+    pthread_mutex_unlock(&gem_slots_lock);
+    return (uint64_t)(int64_t)-err;
+  }
+  if (reserved > size) {
+    pthread_mutex_lock(&gem_slots_lock);
+    if (gem_guards_n == gem_guards_cap) {
+      size_t cap = gem_guards_cap ? gem_guards_cap * 2 : 1024;
+      gem_guard_t *g = realloc(gem_guards, cap * sizeof(*g));
+      if (g) {
+        gem_guards = g;
+        gem_guards_cap = cap;
+      }
+    }
+    if (gem_guards_n < gem_guards_cap) {
+      gem_guards[gem_guards_n].mapped_end = addr + size;
+      gem_guards[gem_guards_n].guard_end = addr + reserved;
+      gem_guards_n++;
+    }
+    pthread_mutex_unlock(&gem_slots_lock);
+  }
+  log_gem("allocation of 0x%lx at 0x%lx (fd %ld)\n", size, addr, (long)fd);
+  return addr;
+}
+
+/* The guest unmapped [addr, addr + len) of the arenas. */
+static uint64_t gem_free(uint64_t addr, uint64_t len) {
+  len = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+  if (!len || !(gem_in_huge(addr) || gem_in_regular(addr)))
+    return (uint64_t)(int64_t)-EINVAL;
+  void *p = mmap((void *)(uintptr_t)addr, len, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+  if (p == MAP_FAILED)
+    return (uint64_t)(int64_t)-errno;
+  uint64_t end = addr + len;
+  pthread_mutex_lock(&gem_slots_lock);
+  for (size_t i = 0; i < gem_guards_n; i++) {
+    if (gem_guards[i].mapped_end == end) {
+      end = gem_guards[i].guard_end;
+      gem_guards[i] = gem_guards[--gem_guards_n];
+      break;
+    }
+  }
+  gem_free_list_add(gem_in_huge(addr) ? &gem_free_huge : &gem_free_regular, addr, end);
+  pthread_mutex_unlock(&gem_slots_lock);
+  return 0;
+}
+
 /* Defined in egl-redirect/xcb.c */
 void create_pixmap_from_kbuf(check *bufs, int i, uint32_t size_bytes,
                              uint32_t stride);
@@ -706,106 +898,15 @@ extern void *mmap_listener(void *arg) {
       break;
 
     case GEM_ALLOCATION:
-      uint64_t size = c->p1;
-      bool use_hugepage_bucket = (size % 0x200000 == 0);
-      bool hugepage_has_capacity =
-          gem_bucket_has_capacity(&gem_hugepage_slots, size,
-                                  (uint64_t)(uintptr_t)hugepage_host_addr,
-                                  huge_region_size);
-      bool regular_has_capacity =
-          gem_bucket_has_capacity(&gem_slots, size,
-                                  (uint64_t)(uintptr_t)data_region_actual_address,
-                                  data_region_size);
-
-      if (use_hugepage_bucket && !hugepage_has_capacity && regular_has_capacity) {
-        log_gem("hugepage bucket full for size 0x%lx, falling back to regular bucket\n",
-                size);
-        use_hugepage_bucket = false;
-      } else if (!use_hugepage_bucket && !regular_has_capacity &&
-                 hugepage_has_capacity) {
-        log_gem("regular bucket full for size 0x%lx, falling back to hugepage bucket\n",
-                size);
-        use_hugepage_bucket = true;
-      }
-
-      if (use_hugepage_bucket) {
-        /* Hugepage capable GEM allocation */
-        log_gem("allocation: HUGEPAGE\n");
-        log_gem("size: 0x%lx, host: 0x%lx, guest: 0x%lx (fd = %d)\n", size,
-                gem_hugepage_slots.host_address,
-                gem_hugepage_slots.guest_address, c->p4);
-
-        if (gem_hugepage_slots.host_address !=
-            gem_hugepage_slots.guest_address) {
-          log_always("FATAL: GEM hugepage slots not identity-mapped "
-                     "(host=0x%lx guest=0x%lx size=0x%lx)\n",
-                     gem_hugepage_slots.host_address,
-                     gem_hugepage_slots.guest_address, size);
-          assert(false);
-        }
-
-        // Unmapping previous mapping (and asserts)
-        assert(hugepage_has_capacity);
-        assert(munmap((void *)(uintptr_t)gem_hugepage_slots.host_address,
-                      size) == 0);
-
-        // Mapping on original offset
-        void *retptr = mmap(
-            (void *)(uintptr_t)gem_hugepage_slots.host_address, c->p1 /*size*/,
-            c->p2, c->p3 | MAP_SHARED | MAP_FIXED, c->p4 - fs_offset, c->p5);
-        if (retptr == MAP_FAILED) {
-          perror("[QEMU-HOST] MMAP failed for GEM_ALLOCATION!!!!!");
-          assert(false);
-        }
-        assert(retptr == (void *)(uintptr_t)gem_hugepage_slots.host_address);
-
-        c->ret = (uint64_t)gem_hugepage_slots.host_address;
-        pthread_mutex_lock(&gem_slots_lock);
-        gem_hugepage_slots.host_address += size;
-        gem_hugepage_slots.guest_address += size;
-        gem_report_peak("hugepage", &gem_hugepage_peak, gem_hugepage_base,
-                        gem_hugepage_slots.host_address, huge_region_size);
-        pthread_mutex_unlock(&gem_slots_lock);
-
-      } else {
-        /* Regular pages for GEM allocation */
-        log_gem("size: 0x%lx, host: 0x%lx, guest: 0x%lx\n", size,
-                gem_slots.host_address, gem_slots.guest_address);
-
-        if (gem_slots.host_address != gem_slots.guest_address) {
-          log_always("FATAL: GEM slots not identity-mapped (host=0x%lx "
-                     "guest=0x%lx size=0x%lx)\n",
-                     gem_slots.host_address, gem_slots.guest_address, size);
-          assert(false);
-        }
-
-        // Unmapping previous mapping (and asserts)
-        assert(regular_has_capacity);
-        assert(munmap((void *)(uintptr_t)gem_slots.host_address, size) == 0);
-
-        // Mapping on original offset
-        void *retptr = mmap(
-            (void *)(uintptr_t)gem_slots.host_address, c->p1 /*size*/, c->p2,
-            c->p3 | MAP_SHARED | MAP_FIXED, c->p4 - fs_offset, c->p5);
-        if (retptr == MAP_FAILED) {
-          perror("[QEMU-HOST] MMAP failed for GEM_ALLOCATION!!!!!");
-          assert(false);
-        }
-        assert(retptr == (void *)(uintptr_t)gem_slots.host_address);
-
-        c->ret = (uint64_t)gem_slots.host_address;
-        pthread_mutex_lock(&gem_slots_lock);
-        gem_slots.host_address += gem_regular_advance(size);
-        gem_slots.guest_address += gem_regular_advance(size);
-        gem_report_peak("regular", &gem_regular_peak, gem_regular_base,
-                        gem_slots.host_address, data_region_size);
-        pthread_mutex_unlock(&gem_slots_lock);
-      }
-
+      c->ret = gem_allocate(c->p1, c->p2, c->p3, c->p4, c->p5);
       complete_request(c);
-
       log_sg("mmap() returned: 0x%lx\n", c->ret);
       mmap_freq++;
+      break;
+
+    case GEM_FREE:
+      c->ret = gem_free(c->p1, c->p2);
+      complete_request(c);
       break;
 
     case FSTAT:
@@ -972,14 +1073,14 @@ extern void *mmap_listener(void *arg) {
 
     case HOST_FLOCK:
       ret = flock(c->p1 - fs_offset, c->p2);
-      c->ret = ret < 0 ? -errno : ret;
+      c->ret = host_ret((long)ret);
       log_sg("[syscall] flock(%d, 0x%lx) = %ld\n", c->p1, c->p2, ret);
       complete_request(c);
       break;
 
     case HOST_FTRUNCATE:
       ret = ftruncate(c->p1 - fs_offset, c->p2);
-      c->ret = ret < 0 ? -errno : ret;
+      c->ret = host_ret((long)ret);
       log_sg("[syscall] ftruncate(%d, 0x%lx) = %ld\n", c->p1, c->p2, ret);
       complete_request(c);
       break;
@@ -1148,6 +1249,9 @@ extern void *mmap_listener(void *arg) {
     }
 
     default:
+      /* an unknown request: complete it, or the guest spins forever */
+      c->ret = (uint64_t)(int64_t)-ENOSYS;
+      complete_request(c);
       break;
     }
   }
