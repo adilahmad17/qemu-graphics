@@ -849,6 +849,13 @@ extern void *mmap_listener(void *arg) {
    * (TIRITH_SLOT_IDLE_US, default 2000) */
   const char *idle_env = getenv("TIRITH_SLOT_IDLE_US");
   long slot_idle_us = idle_env ? atol(idle_env) : 2000;
+  /* slot 0 spins without pause unless TIRITH_SLOT0_IDLE_US is set: then it backs off like the
+   * other slots after that many microseconds without a request (an idle graphics VM then does not
+   * keep a host CPU busy, at the price of up to 50 us for the first request after a pause) */
+  const char *idle0_env = getenv("TIRITH_SLOT0_IDLE_US");
+  long slot0_idle_us = idle0_env ? atol(idle0_env) : -1;
+  if (index == 0 && slot0_idle_us >= 0)
+    slot_idle_us = slot0_idle_us;
 
   /*
    * Event Processing loop
@@ -881,7 +888,7 @@ extern void *mmap_listener(void *arg) {
      * running the full switch range check for every empty poll needlessly halves the listener's
      * polling rate. The acquire load pairs with the guest's release publication and makes the
      * request payload visible before dispatch. */
-    if (index == 0) {
+    if (index == 0 && slot0_idle_us < 0) {
       do {
         req = (RequestType)__atomic_load_n(&c->req_bit, __ATOMIC_ACQUIRE);
       } while (__builtin_expect(req == 0, true));
