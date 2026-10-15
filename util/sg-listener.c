@@ -879,9 +879,26 @@ extern void *mmap_listener(void *arg) {
      * running the full switch range check for every empty poll needlessly halves the listener's
      * polling rate. The acquire load pairs with the guest's release publication and makes the
      * request payload visible before dispatch. */
-    do {
-      req = (RequestType)__atomic_load_n(&c->req_bit, __ATOMIC_ACQUIRE);
-    } while (__builtin_expect(req == 0, true));
+    if (index == 0) {
+      do {
+        req = (RequestType)__atomic_load_n(&c->req_bit, __ATOMIC_ACQUIRE);
+      } while (__builtin_expect(req == 0, true));
+    } else {
+      /* The other slots serve threads that run into a busy slot 0 (a GPU wait in another thread,
+       * for example): spin for a while after a request, then poll every 50 us, so that idle
+       * slots do not each keep a host CPU busy. */
+      struct timespec last, now;
+      clock_gettime(CLOCK_MONOTONIC, &last);
+      for (;;) {
+        req = (RequestType)__atomic_load_n(&c->req_bit, __ATOMIC_ACQUIRE);
+        if (req)
+          break;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long idle_us = (now.tv_sec - last.tv_sec) * 1000000L + (now.tv_nsec - last.tv_nsec) / 1000;
+        if (idle_us > 2000)
+          usleep(50);
+      }
+    }
 #endif
 
     switch (req) {
