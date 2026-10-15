@@ -3367,6 +3367,30 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
         }
     }
 
+    /*
+     * Tirith: let KVM honor the guest's page-attribute types. By default KVM ignores the guest
+     * PAT for RAM (KVM_X86_QUIRK_IGNORE_GUEST_PAT) and maps it write-back. The Gramine guest maps
+     * GPU buffers that the host mapped write-combined (non-snooped AMD GTT memory) as
+     * write-combined too; with the quirk on, its stores stay in the CPU caches and the GPU does
+     * not see them. TIRITH_HONOR_GUEST_PAT=0 keeps KVM's default.
+     */
+    {
+        const char *honor = getenv("TIRITH_HONOR_GUEST_PAT");
+        int quirks = kvm_check_extension(s, KVM_CAP_DISABLE_QUIRKS2);
+        if ((!honor || strcmp(honor, "0")) && (quirks & KVM_X86_QUIRK_IGNORE_GUEST_PAT)) {
+            ret = kvm_vm_enable_cap(s, KVM_CAP_DISABLE_QUIRKS2, 0,
+                                    KVM_X86_QUIRK_IGNORE_GUEST_PAT);
+            if (ret < 0) {
+                warn_report("kvm: could not disable KVM_X86_QUIRK_IGNORE_GUEST_PAT: %s",
+                            strerror(-ret));
+            } else {
+                info_report("kvm: honoring the guest PAT (KVM_X86_QUIRK_IGNORE_GUEST_PAT off)");
+            }
+        } else if (!honor || strcmp(honor, "0")) {
+            warn_report("kvm: KVM cannot honor the guest PAT here (quirk mask 0x%x)", quirks);
+        }
+    }
+
     return 0;
 }
 
