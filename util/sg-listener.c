@@ -39,7 +39,7 @@
 
 /* SYSCALL logging */
 int syscall_logging_enabled = 0;
-static uint64_t fs_offset = 500;
+static uint64_t fs_offset = GRAPHICS_FS_OFFSET; /* the shared ABI header (graphics_comm_abi.h) */
 
 /* Idle sleep configuration: sleep instead of spinning when no requests arrive
  */
@@ -730,7 +730,17 @@ void setup_comm_data_regions(volatile comm_page_t *c) {
   }
   log_always("COMM: 0x%llx\n", (unsigned long long)(uint64_t)(uintptr_t)c);
   log_always("COMM MAGIC: %p\n", (void *)*((uint64_t *)COMM_ADDR));
-  c->magic = 0x2;
+  /* the guest's comm ABI version comes with the magic (graphics_comm_abi.h); a mismatch (for
+   * example a different GRAPHICS_FS_OFFSET) must stop here, loudly, not fail later */
+  if (c->p4 != GRAPHICS_COMM_ABI_VERSION) {
+    fprintf(stderr, "tirith listener: the guest speaks comm ABI version %llu, this QEMU version "
+            "%llu: rebuild qemu-tirith against the guest's gramine-multiarch tree "
+            "(tirith-build.sh)\n", (unsigned long long)c->p4,
+            (unsigned long long)GRAPHICS_COMM_ABI_VERSION);
+    abort();
+  }
+  c->p5 = GRAPHICS_COMM_ABI_VERSION;
+  __atomic_store_n(&c->magic, 0x2, __ATOMIC_RELEASE);
 
   /* The data arena address: the launcher exports GRAMINE_DATA_ADDR into this
    * QEMU process's environment; the compiled 4G anchor remains the fallback.
