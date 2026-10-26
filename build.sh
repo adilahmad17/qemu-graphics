@@ -58,9 +58,9 @@ SAGUARO_GRAPHICS_DIR=$SAGUARO_ROOT/libos/src/graphics
 [ -f "$SAGUARO_ABI_DIR/graphics_comm_abi.h" ] || die "no libos/include/graphics_comm_abi.h under SAGUARO_ROOT=$SAGUARO_ROOT:" \
     "build this repository from vmm/graphics of a Saguaro checkout, or set SAGUARO_ROOT to the Saguaro tree"
 [ -f "$SAGUARO_GRAPHICS_DIR/input_ring.h" ] || die "no libos/src/graphics/input_ring.h under SAGUARO_ROOT=$SAGUARO_ROOT"
-# util/sg-xcb.c is the one copy of Saguaro's libos/src/graphics/xcb.c; only the SPDX line may differ
-cmp -s <(tail -n +2 "$HERE/util/sg-xcb.c") <(tail -n +2 "$SAGUARO_GRAPHICS_DIR/xcb.c") ||
-    die "util/sg-xcb.c differs from $SAGUARO_GRAPHICS_DIR/xcb.c (only the SPDX license line may differ):" \
+# util/sg-xcb.c is the one copy of Saguaro's libos/src/graphics/xcb.c (both under LGPL-3.0-or-later OR GPL-2.0-or-later)
+cmp -s "$HERE/util/sg-xcb.c" "$SAGUARO_GRAPHICS_DIR/xcb.c" ||
+    die "util/sg-xcb.c differs from $SAGUARO_GRAPHICS_DIR/xcb.c:" \
         "copy the file from that tree, or use the Saguaro revision this one matches"
 
 if [ $DEPS = 1 ]; then
