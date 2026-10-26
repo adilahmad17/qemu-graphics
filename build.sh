@@ -91,7 +91,10 @@ mkdir -p "$PREFIX"
 log "configuring QEMU (graphics ABI from $SAGUARO_ROOT)"
 mkdir -p "$BUILD"
 cd "$BUILD"
-../configure --prefix="$PREFIX" --target-list=x86_64-softmmu --enable-kvm \
+# a shallow checkout (a git submodule) has no tags for `git describe`: name the revision explicitly
+PKGVERSION=
+if rev=$(git -C "$HERE" rev-parse --short=10 HEAD 2>/dev/null); then PKGVERSION="--with-pkgversion=g$rev"; fi
+../configure --prefix="$PREFIX" --target-list=x86_64-softmmu --enable-kvm $PKGVERSION \
     --extra-cflags="-I$SAGUARO_ABI_DIR -I$SAGUARO_GRAPHICS_DIR" \
     --disable-docs --disable-werror
 log "building QEMU ($JOBS jobs)"
