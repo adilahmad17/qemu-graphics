@@ -83,8 +83,8 @@ static void ram_bases_init(void) {
     g_strfreev(parts);
 }
 
-static const size_t LOW_OFFSET_INTO_MEMORY = 0x40000000ULL;           // 1MB
-// static const void *VIRTUAL_ADDRESS_LOW = (void*)0x40000000ULL;        // 1MB
+static const size_t LOW_OFFSET_INTO_MEMORY = 0x40000000ULL;           // 1GB
+// static const void *VIRTUAL_ADDRESS_LOW = (void*)0x40000000ULL;        // 1GB
 static const size_t HIGH_OFFSET_INTO_MEMORY = 0x80000000ULL;        // 2GB
 // static const void *VIRTUAL_ADDRESS_HIGH = (void*)0x100000000ULL;    // 4GB
 // static const void *VIRTUAL_ADDRESS_HIGH = (void*)0x140000000ULL;    // 5GB
@@ -281,7 +281,7 @@ static void *mmap_reserve_at(void *want, size_t size, int fd)
     return MAP_FAILED;
 }
 
-/* Really bad heuristic, but it will do for now. */
+/* Index of the next shared (memfd) RAM backend to place, in -object order. */
 int dimm_counter = 0;
 
 /* Track whether we kept a guard page for a given RAM mapping. */
@@ -433,7 +433,7 @@ static void *mmap_activate(void *ptr, size_t size, int fd,
         if (dimm_counter + 1 >= nbases) {
             /* last memfd backend: everything the listener polls (the comm page
              * and the arena addresses) is mapped once the guest starts; spawn it */
-            log_always("[*] Spawing mmap listener thread \n");
+            log_always("[*] Spawning mmap listener thread \n");
             if (!mmap_listen_thr_started) {
                 mmap_listen_thr_started = 1;
                 pthread_attr_t attr;
