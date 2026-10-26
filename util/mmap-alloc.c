@@ -45,7 +45,7 @@ static inline int64_t boot_elapsed_us(void) {
     return g_get_monotonic_time() - boot_t0_us;
 }
 
-/* gramine-vm exports GRAMINE_RAM_BASES: the guest-physical base of every memfd
+/* saguaro-vm exports GRAMINE_RAM_BASES: the guest-physical base of every memfd
  * backend, comma-separated decimals in -object order (QEMU places -numa node 0
  * at physical 0 and every later node sequentially from 4G). With the list, the
  * identity-native placement follows it per backend and the mmap listener starts
@@ -378,7 +378,7 @@ static void *mmap_activate(void *ptr, size_t size, int fd,
     }
 
 #if 1
-    /* The guest-physical placement of the gramine-vm memory map; see the
+    /* The guest-physical placement of the saguaro-vm memory map; see the
      * GRAMINE_RAM_BASES comment at ram_bases_init() above. */
     if (boot_t0_us < 0) {
         boot_t0_us = g_get_monotonic_time();

@@ -19,9 +19,9 @@
 
 /*
  * The shared Tirith graphics ABI -- the comm page, the request ids, the common
- * buffer state and the fallback arena geometry -- defined once in the sibling
- * gramine-multiarm checkout (libos/include/graphics_comm_abi.h) and resolved by
- * the build (tirith-build.sh exports GRAMINE_ABI_DIR). Everything the guest
+ * buffer state and the fallback arena geometry -- defined once in the Saguaro
+ * tree (libos/include/graphics_comm_abi.h) and resolved by the build (build.sh
+ * adds that directory of SAGUARO_ROOT to the include path). Everything the guest
  * stores into, or this listener serves out of, the comm page comes from there.
  */
 #include "graphics_comm_abi.h"

@@ -3369,7 +3369,7 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
 
     /*
      * Tirith: let KVM honor the guest's page-attribute types. By default KVM ignores the guest
-     * PAT for RAM (KVM_X86_QUIRK_IGNORE_GUEST_PAT) and maps it write-back. The Gramine guest maps
+     * PAT for RAM (KVM_X86_QUIRK_IGNORE_GUEST_PAT) and maps it write-back. The Saguaro guest maps
      * GPU buffers that the host mapped write-combined (non-snooped AMD GTT memory) as
      * write-combined too; with the quirk on, its stores stay in the CPU caches and the GPU does
      * not see them. TIRITH_HONOR_GUEST_PAT=0 keeps KVM's default.

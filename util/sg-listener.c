@@ -734,8 +734,8 @@ void setup_comm_data_regions(volatile comm_page_t *c) {
    * example a different GRAPHICS_FS_OFFSET) must stop here, loudly, not fail later */
   if (c->p4 != GRAPHICS_COMM_ABI_VERSION) {
     fprintf(stderr, "tirith listener: the guest speaks comm ABI version %llu, this QEMU version "
-            "%llu: rebuild qemu-tirith against the guest's gramine-multiarch tree "
-            "(tirith-build.sh)\n", (unsigned long long)c->p4,
+            "%llu: rebuild this QEMU against the guest's Saguaro tree "
+            "(build.sh, SAGUARO_ROOT)\n", (unsigned long long)c->p4,
             (unsigned long long)GRAPHICS_COMM_ABI_VERSION);
     abort();
   }
