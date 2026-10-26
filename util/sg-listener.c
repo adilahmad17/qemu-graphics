@@ -688,8 +688,12 @@ int win_width = 300;
 int win_height = 300;
 uint64_t handle_to_size[1024];
 
+/* cpus_queue is defined by the system emulator; the tools and tests that link libqemuutil
+ * without it see a null address */
+#pragma weak cpus_queue
+
 int get_guest_tsc_info(uint64_t *offset, uint32_t *frequency_khz) {
-  if (!first_cpu || !offset || !frequency_khz)
+  if (!&cpus_queue || !first_cpu || !offset || !frequency_khz)
     return -EINVAL;
 
   struct kvm_device_attr attribute = {
